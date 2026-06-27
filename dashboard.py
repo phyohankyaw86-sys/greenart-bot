@@ -4,24 +4,21 @@ import sqlite3
 app = Flask(__name__)
 
 def get_data():
-    conn = sqlite3.connect("greenart.db")
-    c = conn.cursor()
-    
-    c.execute("SELECT SUM(total), COUNT(*) FROM sales")
-    revenue, count = c.fetchone()
-    
-    c.execute("SELECT item, SUM(total) FROM sales GROUP BY item")
-    items = c.fetchall()
-    
-    c.execute("SELECT channel, SUM(total) FROM sales GROUP BY channel")
-    channels = c.fetchall()
-    
-    c.execute("SELECT date, SUM(total) FROM sales GROUP BY date ORDER BY date")
-    daily = c.fetchall()
-    
-    conn.close()
-    return revenue or 0, count or 0, items, channels, daily
-
+    try:
+        conn = sqlite3.connect("greenart.db")
+        c = conn.cursor()
+        c.execute("SELECT SUM(total), COUNT(*) FROM sales")
+        revenue, count = c.fetchone()
+        c.execute("SELECT item, SUM(total) FROM sales GROUP BY item")
+        items = c.fetchall()
+        c.execute("SELECT channel, SUM(total) FROM sales GROUP BY channel")
+        channels = c.fetchall()
+        c.execute("SELECT date, SUM(total) FROM sales GROUP BY date ORDER BY date")
+        daily = c.fetchall()
+        conn.close()
+        return revenue or 0, count or 0, items, channels, daily
+    except:
+        return 0, 0, [], [], []
 HTML = """
 <!DOCTYPE html>
 <html>
