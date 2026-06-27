@@ -1,0 +1,5 @@
+.env
+greenart.db
+__pycache__/
+*.pyc
+GreenArt_BeefJerky_MASTER_Workbook.xlsx
