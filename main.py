@@ -1,85 +1,163 @@
 import os
-import threading
+import asyncio
 from dotenv import load_dotenv
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
+from database import init_db, save_sale, get_monthly_summary, get_kpi, get_pl_summary
+from datetime import datetime
+from flask import Flask, render_template_string
+import threading
 
 load_dotenv()
+TOKEN = os.getenv("TELEGRAM_TOKEN")
 
-def run_bot():
-    import asyncio
-    from telegram import Update
-    from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
-    from database import init_db, save_sale, get_monthly_summary, get_kpi, get_pl_summary
-    from datetime import datetime
+init_db()
 
-    TOKEN = os.getenv("TELEGRAM_TOKEN")
-    init_db()
+# Flask app
+flask_app = Flask(__name__)
 
-    async def start(update: Update, context):
+def get_data():
+    try:
+        import sqlite3
+        conn = sqlite3.connect("greenart.db")
+        c = conn.cursor()
+        c.execute("SELECT SUM(total), COUNT(*) FROM sales")
+        revenue, count = c.fetchone()
+        c.execute("SELECT item, SUM(total) FROM sales GROUP BY item")
+        items = c.fetchall()
+        c.execute("SELECT channel, SUM(total) FROM sales GROUP BY channel")
+        channels = c.fetchall()
+        c.execute("SELECT date, SUM(total) FROM sales GROUP BY date ORDER BY date")
+        daily = c.fetchall()
+        c.execute("SELECT SUM(total_cost) FROM production")
+        prod_cost = c.fetchone()[0] or 0
+        c.execute("SELECT value FROM assumptions WHERE key='Monthly Labor Cost (Total)'")
+        row = c.fetchone()
+        labor = row[0] if row else 0
+        c.execute("SELECT value FROM assumptions WHERE key='Utilities Cost per Month'")
+        row = c.fetchone()
+        utilities = row[0] if row else 0
+        conn.close()
+        revenue = revenue or 0
+        total_cost = prod_cost + labor + utilities
+        gross_profit = revenue - prod_cost
+        net_profit = revenue - total_cost
+        margin = round((net_profit / revenue * 100), 1) if revenue > 0 else 0
+        return {
+            "revenue": int(revenue), "count": count or 0,
+            "prod_cost": int(prod_cost), "labor": int(labor),
+            "utilities": int(utilities), "total_cost": int(total_cost),
+            "gross_profit": int(gross_profit), "net_profit": int(net_profit),
+            "margin": margin, "items": items, "channels": channels, "daily": daily
+        }
+    except:
+        return {
+            "revenue": 0, "count": 0, "prod_cost": 0, "labor": 0,
+            "utilities": 0, "total_cost": 0, "gross_profit": 0,
+            "net_profit": 0, "margin": 0,
+            "items": [], "channels": [], "daily": []
+        }
+
+HTML = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>GreenArt Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>body{font-family:Arial;background:#f0f2f5;padding:16px}h1{color:#2d7a2d;text-align:center}
+.cards{display:flex;flex-wrap:wrap;gap:12px;justify-content:center;margin:20px 0}
+.card{background:white;border-radius:12px;padding:16px 20px;text-align:center;box-shadow:0 2px 8px rgba(0,0,0,0.08);flex:1;min-width:140px}
+.card h2{font-size:22px;color:#2d7a2d;margin-bottom:4px}.card p{color:#888;font-size:13px}
+.pl-box{background:white;border-radius:12px;padding:20px;margin-bottom:20px;box-shadow:0 2px 8px rgba(0,0,0,0.08)}
+.pl-box h3{color:#2d7a2d;margin-bottom:12px}
+.pl-row{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #f0f0f0;font-size:14px}
+.pl-row.total{font-weight:bold;border-top:2px solid #2d7a2d;border-bottom:none;color:#2d7a2d;font-size:16px}
+.pl-row.minus{color:#e53935}
+.charts{display:flex;flex-wrap:wrap;gap:16px;justify-content:center}
+.chart-box{background:white;border-radius:12px;padding:16px;box-shadow:0 2px 8px rgba(0,0,0,0.08);width:100%;max-width:420px}
+</style></head><body>
+<h1>🥩 GreenArt Beef Jerky Dashboard</h1>
+<div class="cards">
+<div class="card"><h2>{{ "{:,}".format(d.revenue) }}</h2><p>Revenue (ကျပ်)</p></div>
+<div class="card"><h2>{{ d.count }}</h2><p>ရောင်းချမှု</p></div>
+<div class="card"><h2>{{ "{:,}".format(d.net_profit) }}</h2><p>Net Profit (ကျပ်)</p></div>
+<div class="card"><h2>{{ d.margin }}%</h2><p>Net Margin</p></div>
+</div>
+<div class="pl-box"><h3>💰 Profit & Loss</h3>
+<div class="pl-row"><span>📈 Revenue</span><span>{{ "{:,}".format(d.revenue) }} ကျပ်</span></div>
+<div class="pl-row minus"><span>➖ Production</span><span>({{ "{:,}".format(d.prod_cost) }}) ကျပ်</span></div>
+<div class="pl-row"><span>✅ Gross Profit</span><span>{{ "{:,}".format(d.gross_profit) }} ကျပ်</span></div>
+<div class="pl-row minus"><span>➖ Labor</span><span>({{ "{:,}".format(d.labor) }}) ကျပ်</span></div>
+<div class="pl-row minus"><span>➖ Utilities</span><span>({{ "{:,}".format(d.utilities) }}) ကျပ်</span></div>
+<div class="pl-row total"><span>🏆 Net Profit</span><span>{{ "{:,}".format(d.net_profit) }} ကျပ်</span></div>
+</div>
+<div class="charts">
+<div class="chart-box"><canvas id="itemChart"></canvas></div>
+<div class="chart-box"><canvas id="channelChart"></canvas></div>
+</div>
+<script>
+new Chart(document.getElementById('itemChart'),{type:'bar',data:{labels:{{ item_labels|safe }},datasets:[{label:'Revenue',data:{{ item_data|safe }},backgroundColor:'#2d7a2d'}]},options:{plugins:{title:{display:true,text:'Product Revenue'}}}});
+new Chart(document.getElementById('channelChart'),{type:'pie',data:{labels:{{ channel_labels|safe }},datasets:[{data:{{ channel_data|safe }},backgroundColor:['#2d7a2d','#5ab85a','#a8d8a8','#d4edda']}]},options:{plugins:{title:{display:true,text:'Channel'}}}});
+</script></body></html>"""
+
+@flask_app.route("/")
+def dashboard():
+    from types import SimpleNamespace
+    d = get_data()
+    data = SimpleNamespace(**d)
+    return render_template_string(HTML, d=data,
+        item_labels=str([i[0] for i in d['items']]),
+        item_data=str([i[1] for i in d['items']]),
+        channel_labels=str([c[0] for c in d['channels']]),
+        channel_data=str([c[1] for c in d['channels']]))
+
+def run_flask():
+    port = int(os.environ.get("PORT", 5000))
+    flask_app.run(host="0.0.0.0", port=port)
+
+async def main():
+    async def start(update, context):
         await update.message.reply_text(
-            "🥩 GreenArt Beef Jerky Bot မှ ကြိုဆိုပါတယ်!\n\n"
-            "ရောင်းအား မှတ်ဖို့:\n"
+            "🥩 GreenArt Beef Jerky Bot\n\n"
             "ဥပမာ: MaHla 100g 10 5000 retail\n\n"
-            "/report - ဒီလ ရလဒ်\n"
-            "/kpi - အရောင်းစာရင်း\n"
-            "/pl - Profit & Loss"
+            "/report /kpi /pl"
         )
 
-    async def report(update: Update, context):
+    async def report(update, context):
         count, revenue = get_monthly_summary()
-        await update.message.reply_text(
-            f"📊 ဒီလ ရလဒ်\n"
-            f"ရောင်းအရေအတွက်: {count} ကြိမ်\n"
-            f"စုစုပေါင်း Revenue: {revenue:,} ကျပ်"
-        )
+        await update.message.reply_text(f"📊 ဒီလ\nရောင်း: {count}ကြိမ်\nRevenue: {revenue:,}ကျပ်")
 
-    async def kpi(update: Update, context):
+    async def kpi(update, context):
         items, channels = get_kpi()
-        msg = "📊 KPI Summary\n\n"
-        msg += "🥩 Product အလိုက်:\n"
+        msg = "📊 KPI\n\n🥩 Product:\n"
         for item, qty, total in items:
             msg += f"  {item}: {qty}ထုပ် — {total:,}ကျပ်\n"
-        msg += "\n📦 Channel အလိုက်:\n"
+        msg += "\n📦 Channel:\n"
         for channel, total in channels:
             msg += f"  {channel}: {total:,}ကျပ်\n"
         await update.message.reply_text(msg)
 
-    async def pl(update: Update, context):
+    async def pl(update, context):
         d = get_pl_summary()
         await update.message.reply_text(
-            f"💰 Profit & Loss Summary\n\n"
-            f"📈 Revenue:        {d['revenue']:>12,} ကျပ်\n"
-            f"➖ Production:     {d['prod_cost']:>12,} ကျပ်\n"
-            f"➖ Labor:          {d['labor']:>12,} ကျပ်\n"
-            f"➖ Utilities:      {d['utilities']:>12,} ကျပ်\n"
-            f"──────────────────────\n"
-            f"✅ Gross Profit:   {d['gross_profit']:>12,} ကျပ်\n"
-            f"✅ Net Profit:     {d['net_profit']:>12,} ကျပ်\n"
-            f"📊 Net Margin:     {d['margin']:>11}%"
+            f"💰 P&L\nRevenue: {d['revenue']:,}ကျပ်\n"
+            f"Net Profit: {d['net_profit']:,}ကျပ်\n"
+            f"Margin: {d['margin']}%"
         )
 
-    async def handle_message(update: Update, context):
-        text = update.message.text.strip()
-        parts = text.split()
+    async def handle_message(update, context):
+        parts = update.message.text.strip().split()
         if len(parts) >= 4:
             try:
-                customer = parts[0]
-                item = f"Beef Jerky {parts[1]}"
-                quantity = int(parts[2])
-                unit_price = int(parts[3])
+                customer, item_size = parts[0], parts[1]
+                qty, price = int(parts[2]), int(parts[3])
                 channel = parts[4] if len(parts) > 4 else "retail"
                 date = datetime.now().strftime("%Y-%m-%d")
-                total = save_sale(date, customer, channel, item, quantity, unit_price)
-                await update.message.reply_text(
-                    f"✅ မှတ်တမ်းတင်ပြီ!\n"
-                    f"ဖောက်သည်: {customer}\n"
-                    f"ပစ္စည်း: {item}\n"
-                    f"အရေအတွက်: {quantity}\n"
-                    f"စုစုပေါင်း: {total:,} ကျပ်"
-                )
+                total = save_sale(date, customer, channel, f"Beef Jerky {item_size}", qty, price)
+                await update.message.reply_text(f"✅ မှတ်တမ်းတင်ပြီ!\nစုစုပေါင်း: {total:,}ကျပ်")
             except Exception as e:
-                await update.message.reply_text(f"❌ Error: {e}\nဥပမာ: MaHla 100g 10 5000 retail")
+                await update.message.reply_text(f"❌ Error: {e}")
         else:
             await update.message.reply_text("ဥပမာ: MaHla 100g 10 5000 retail")
+
+    t = threading.Thread(target=run_flask, daemon=True)
+    t.start()
 
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
@@ -87,17 +165,8 @@ def run_bot():
     app.add_handler(CommandHandler("kpi", kpi))
     app.add_handler(CommandHandler("pl", pl))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
     print("Bot စတင်နေပြီ...")
-    app.run_polling()
-
-def run_dashboard():
-    from dashboard import app
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    await app.run_polling()
 
 if __name__ == "__main__":
-    t = threading.Thread(target=run_bot)
-    t.daemon = True
-    t.start()
-    run_dashboard()
+    asyncio.run(main())
