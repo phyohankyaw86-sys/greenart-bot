@@ -52,3 +52,41 @@ def get_kpi():
     channels = c.fetchall()
     conn.close()
     return items, channels
+def get_pl_summary():
+    conn = sqlite3.connect("greenart.db")
+    c = conn.cursor()
+    
+    # Revenue
+    c.execute("SELECT SUM(total) FROM sales")
+    revenue = c.fetchone()[0] or 0
+    
+    # Production Cost
+    c.execute("SELECT SUM(total_cost) FROM production")
+    prod_cost = c.fetchone()[0] or 0
+    
+    # Assumptions မှ Labor & Utilities
+    c.execute("SELECT value FROM assumptions WHERE key='Monthly Labor Cost (Total)'")
+    row = c.fetchone()
+    labor = row[0] if row else 0
+    
+    c.execute("SELECT value FROM assumptions WHERE key='Utilities Cost per Month'")
+    row = c.fetchone()
+    utilities = row[0] if row else 0
+    
+    conn.close()
+    
+    total_cost = prod_cost + labor + utilities
+    gross_profit = revenue - prod_cost
+    net_profit = revenue - total_cost
+    margin = (net_profit / revenue * 100) if revenue > 0 else 0
+    
+    return {
+        "revenue": int(revenue),
+        "prod_cost": int(prod_cost),
+        "labor": int(labor),
+        "utilities": int(utilities),
+        "total_cost": int(total_cost),
+        "gross_profit": int(gross_profit),
+        "net_profit": int(net_profit),
+        "margin": round(margin, 1)
+    }

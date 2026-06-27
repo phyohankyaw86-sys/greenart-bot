@@ -2,7 +2,7 @@ import os
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
-from database import init_db, save_sale, get_monthly_summary, get_kpi
+from database import init_db, save_sale, get_monthly_summary, get_kpi, get_pl_summary
 from datetime import datetime
 
 load_dotenv()
@@ -38,6 +38,19 @@ async def kpi(update: Update, context):
     for channel, total in channels:
         msg += f"  {channel}: {total:,}ကျပ်\n"
     await update.message.reply_text(msg)
+async def pl(update: Update, context):
+    d = get_pl_summary()
+    await update.message.reply_text(
+        f"💰 Profit & Loss Summary\n\n"
+        f"📈 Revenue:        {d['revenue']:>12,} ကျပ်\n"
+        f"➖ Production:     {d['prod_cost']:>12,} ကျပ်\n"
+        f"➖ Labor:          {d['labor']:>12,} ကျပ်\n"
+        f"➖ Utilities:      {d['utilities']:>12,} ကျပ်\n"
+        f"──────────────────────\n"
+        f"✅ Gross Profit:   {d['gross_profit']:>12,} ကျပ်\n"
+        f"✅ Net Profit:     {d['net_profit']:>12,} ကျပ်\n"
+        f"📊 Net Margin:     {d['margin']:>11}%"
+    )
 
 async def handle_message(update: Update, context):
     text = update.message.text.strip()
@@ -67,6 +80,7 @@ app = ApplicationBuilder().token(TOKEN).build()
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("report", report))
 app.add_handler(CommandHandler("kpi", kpi))
+app.add_handler(CommandHandler("pl", pl))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
 print("Bot စတင်နေပြီ...")
