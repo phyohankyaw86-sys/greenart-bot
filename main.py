@@ -1,3 +1,7 @@
+import psycopg2
+
+def get_pg_conn():
+    return psycopg2.connect(os.getenv("DATABASE_URL"))
 import os
 import asyncio
 import threading
@@ -17,7 +21,7 @@ flask_app = Flask(__name__)
 
 def get_data():
     try:
-        conn = sqlite3.connect("greenart.db")
+        conn = get_pg_conn()
         c = conn.cursor()
         c.execute("SELECT SUM(total), COUNT(*) FROM sales")
         revenue, count = c.fetchone()
@@ -45,7 +49,8 @@ def get_data():
             "net_profit": int(net_profit),
             "margin": margin, "items": items, "channels": channels
         }
-    except:
+    except Exception as e:
+        print(f"DB Error: {e}")
         return {
             "revenue": 0, "count": 0, "prod_cost": 0, "labor": 0,
             "utilities": 0, "gross_profit": 0, "net_profit": 0,

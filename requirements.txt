@@ -4,3 +4,4 @@ python-dotenv
 flask
 pandas
 openpyxl
+psycopg2-binary
