@@ -1,19 +1,19 @@
 """
 GreenArt Beef Jerky — AI Telegram Bot + Flask Dashboard
 =========================================================
-Telegram: Natural Burmese/English NLP via Claude AI
+Telegram: Natural Burmese/English NLP (local rule-based + optional Claude)
 Flask:    Executive dashboard on PORT env var
 
-Commands (natural language — Claude parses everything):
+Commands:
   ဒီနေ့ ရောင်းအား
   MaHla 100g 10 5000 retail
   Batch001 beef 5kg → 2.8kg
   Marketing 50000 cash
-  add beef 10kg 15000
-  /report /kpi /pl /stock /yield /help
+  beef 10kg ဝယ်လာ 15000
+  /report /kpi /pl /stock /yield /alerts /help
 """
 
-import os, asyncio, threading
+import os, asyncio, threading, json
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -21,16 +21,17 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
 
 from flask import Flask, render_template_string
+
 from database import (
-    init_db, save_sale, get_monthly_summary, get_kpi, get_pl_summary,
+    init_db, get_monthly_summary, get_kpi, get_pl_summary,
     get_dashboard_kpi, save_production_batch, save_yield, save_expense,
     add_stock, use_stock, get_stock, get_low_stock, get_yield_summary,
     get_today_revenue, get_assumption,
 )
-from nlp_parser import parse_intent   # 100% free — no API needed
-from sale_engine import (             # 11-step auto flow
+from nlp_parser import parse_intent
+from sale_engine import (
     process_sale, format_sale_reply,
-    init_engine_tables, get_unresolved_alerts, get_dashboard_cache,
+    init_engine_tables, get_unresolved_alerts,
 )
 
 load_dotenv()
@@ -38,71 +39,6 @@ TOKEN = os.getenv("TELEGRAM_TOKEN")
 
 init_db()
 init_engine_tables()
-
-# ── AI NLP PARSER ─────────────────────────────────────────────────────────────
-
-SYSTEM_PROMPT = """You are the AI parser for GreenArt Beef Jerky (Myanmar).
-Parse the user's Burmese or English message into a JSON action object.
-
-ACTIONS:
-1. record_sale        — someone bought jerky
-2. record_batch       — production batch completed (raw beef in → dried jerky out)
-3. record_expense     — expense/cost recorded
-4. add_inventory      — stock added (raw material or packaging bought)
-5. use_inventory      — stock used in production
-6. query_sales        — asking about sales/revenue
-7. query_pl           — asking about profit/loss/margin
-8. query_yield        — asking about yield %
-9. query_stock        — asking about inventory/stock
-10. query_kpi         — general KPI / dashboard
-11. unknown           — cannot parse
-
-Reply ONLY with valid JSON. Nothing else.
-
-Examples:
-User: "MaHla 100g 10 5000 retail"
-{"action":"record_sale","customer":"MaHla","item":"Beef Jerky 100g","quantity":10,"unit_price":5000,"channel":"retail","delivery_ch":"Direct","delivery_fee":0}
-
-User: "ဒီနေ့ ရောင်းအား"
-{"action":"query_sales","period":"today"}
-
-User: "Batch002 beef 5kg 2.8kg output"
-{"action":"record_batch","batch_no":"Batch002","raw_beef_kg":5,"dried_output_kg":2.8}
-
-User: "Marketing Facebook 50000 bank"
-{"action":"record_expense","description":"Facebook Marketing","category":"Marketing","amount":50000,"payment_method":"Bank Transfer"}
-
-User: "beef 10kg ဝယ်လာတယ် 15000 per kg"
-{"action":"add_inventory","item":"Raw Beef","category":"raw_material","quantity":10,"unit":"kg","unit_cost":15000}
-
-User: "ဒီလ profit"
-{"action":"query_pl","period":"month"}
-
-User: "yield ဘယ်လောက်ရှိလဲ"
-{"action":"query_yield"}
-
-User: "stock လက်ကျန်"
-{"action":"query_stock"}
-
-For record_sale: item options = "Beef Jerky 20g" | "Beef Jerky 50g" | "Beef Jerky 100g" | "Beef Jerky 200g"
-channel options = "retail" | "wholesale" | "distributor" | "online"
-If period not specified, default to "month".
-"""
-
-
-def parse_intent(text: str) -> dict:
-    """Call Claude to parse user message into structured intent."""
-    try:
-        resp = AI.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=300,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": text}],
-        )
-        raw = resp.content[0].text.strip()
-        return json.loads(raw)
-    except Exception as e:
-        return {"action": "unknown", "error": str(e)}
 
 
 # ── BOT HANDLERS ──────────────────────────────────────────────────────────────
@@ -117,7 +53,7 @@ async def cmd_start(update: Update, context):
         "• `ဒီလ profit` — P&L ကြည့်\n"
         "• `Batch001 5kg beef → 3kg` — Batch မှတ်\n"
         "• `Marketing 50000 cash` — Expense မှတ်\n"
-        "• `beef 10kg ဝယ်လာ 15000/kg` — Stock ထည့်\n"
+        "• `beef 10kg ဝယ်လာ 15000` — Stock ထည့်\n"
         "• `yield ဘယ်လောက်ရှိလဲ` — Yield ကြည့်\n\n"
         "/report /kpi /pl /stock /yield /alerts",
         parse_mode="Markdown"
@@ -168,19 +104,22 @@ async def cmd_pl(update: Update, context):
 
 async def cmd_stock(update: Update, context):
     rows = get_stock()
-    low = get_low_stock()
+    low  = get_low_stock()
     if not rows:
-        await update.message.reply_text("📦 Stock data မရှိသေးပါ — /buy နဲ့ ထည့်ပါ")
+        await update.message.reply_text("📦 Stock data မရှိသေးပါ")
         return
     msg = "📦 *Stock Level*\n\n"
-    cat_labels = {"raw_material": "🥩 Raw Material", "packaging": "📦 Packaging",
-                  "finished_goods": "✅ Finished Goods"}
+    cat_labels = {
+        "raw_material":  "🥩 Raw Material",
+        "packaging":     "📦 Packaging",
+        "finished_goods":"✅ Finished Goods",
+    }
     current = None
     for item, cat, qty, unit, cost, val in rows:
         if cat != current:
             msg += f"\n*{cat_labels.get(cat, cat)}:*\n"
             current = cat
-        warn = " ⚠️" if qty <= 5 else ""
+        warn = " ⚠️" if float(qty) <= 5 else ""
         msg += f"  {item}: `{qty} {unit}`  (Value: `{int(val):,}` ကျပ်){warn}\n"
     if low:
         msg += f"\n🔴 *Low Stock Alert ({len(low)} items):*\n"
@@ -192,12 +131,12 @@ async def cmd_stock(update: Update, context):
 async def cmd_yield(update: Update, context):
     d = get_yield_summary()
     if not d or not d.get("batches"):
-        await update.message.reply_text("🌡️ Batch data မရှိသေးပါ။ Batch မှတ်တမ်းတင်ပါ")
+        await update.message.reply_text("🌡️ Batch data မရှိသေးပါ")
         return
     target = get_assumption("Expected Yield % (ကျပ်ကျပ်သားနှုန်း)", 0.6) * 100
-    avg = float(d.get("avg_yield_pct") or 0)
-    diff = round(avg - target, 1)
-    arrow = "🟢 +" if diff >= 0 else "🔴 "
+    avg    = float(d.get("avg_yield_pct") or 0)
+    diff   = round(avg - target, 1)
+    arrow  = "🟢 +" if diff >= 0 else "🔴 "
     await update.message.reply_text(
         f"🌡️ *Yield Tracking Summary*\n\n"
         f"Batches logged:    `{d['batches']}`\n"
@@ -219,12 +158,10 @@ async def cmd_alerts(update: Update, context):
             parse_mode="Markdown"
         )
         return
-
     msg = f"🚨 *Alerts ({len(rows)} ခု)*\n\n"
     for a in rows:
         msg += f"{a['message']}\n"
         msg += f"  _({a['date']} · {a['category']})_\n\n"
-
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
@@ -235,21 +172,21 @@ async def handle_message(update: Update, context):
     if not text:
         return
 
-    # Quick-parse sales pattern: "Name size qty price [channel]"
+    # Fast-path: "Name size qty price [channel]"
     parts = text.split()
-    if (len(parts) >= 4 and
-        any(g in parts[1].lower() for g in ["20g","50g","100g","200g"]) and
-        parts[2].isdigit() and parts[3].isdigit()):
-        customer = parts[0]
-        size     = parts[1].upper()
-        qty      = int(parts[2])
-        price    = int(parts[3])
-        channel  = parts[4] if len(parts) > 4 else "retail"
-        r = process_sale(customer, f"Beef Jerky {size}", qty, price, channel)
+    if (len(parts) >= 4
+            and any(g in parts[1].lower() for g in ["20g","50g","100g","200g"])
+            and parts[2].isdigit() and parts[3].isdigit()):
+        r = process_sale(
+            customer   = parts[0],
+            item       = f"Beef Jerky {parts[1].upper()}",
+            quantity   = int(parts[2]),
+            unit_price = int(parts[3]),
+            channel    = parts[4] if len(parts) > 4 else "retail",
+        )
         await update.message.reply_text(format_sale_reply(r), parse_mode="Markdown")
         return
 
-    # NLP parse (free, local)
     intent = parse_intent(text)
     action = intent.get("action", "unknown")
 
@@ -258,28 +195,27 @@ async def handle_message(update: Update, context):
 
         if action == "record_sale":
             r = process_sale(
-                customer   = intent.get("customer", "Unknown"),
-                item       = intent.get("item", "Beef Jerky 100g"),
-                quantity   = intent.get("quantity", 1),
-                unit_price = intent.get("unit_price", 0),
-                channel    = intent.get("channel", "retail"),
-                delivery_ch= intent.get("delivery_ch", "Direct"),
-                delivery_fee=intent.get("delivery_fee", 0),
-                sale_date  = date,
+                customer    = intent.get("customer", "Unknown"),
+                item        = intent.get("item", "Beef Jerky 100g"),
+                quantity    = int(intent.get("quantity", 1)),
+                unit_price  = int(intent.get("unit_price", 0)),
+                channel     = intent.get("channel", "retail"),
+                delivery_ch = intent.get("delivery_ch", "Direct"),
+                delivery_fee= int(intent.get("delivery_fee", 0)),
+                sale_date   = date,
             )
             await update.message.reply_text(format_sale_reply(r), parse_mode="Markdown")
 
         elif action == "record_batch":
-            bn = intent.get("batch_no", f"B{datetime.now().strftime('%Y%m%d%H%M')}")
+            bn  = intent.get("batch_no") or f"B{datetime.now().strftime('%Y%m%d%H%M')}"
             raw = float(intent.get("raw_beef_kg", 0))
             dry = float(intent.get("dried_output_kg", 0))
-            # Cost from assumptions
-            labor   = get_assumption("Labor Cost per Batch", 47500)
-            util    = get_assumption("Utilities Cost per Batch", 19875)
-            beef_p  = get_assumption("Beef Purchase Price per kg", 15000)
-            season  = get_assumption("Seasoning & Sauce Cost per batch", 5750)
+            labor   = get_assumption("Labor Cost per Batch",              47500)
+            util    = get_assumption("Utilities Cost per Batch",          19875)
+            beef_p  = get_assumption("Beef Purchase Price per kg",        15000)
+            season  = get_assumption("Seasoning & Sauce Cost per batch",   5750)
+            pkg     = get_assumption("Misc Packaging (per batch)",          1500)
             raw_mat = int(raw * beef_p + season)
-            pkg     = get_assumption("Misc Packaging (per batch)", 1500)
             total, cpg = save_production_batch(
                 date, bn, raw, dry, raw_mat, int(pkg), int(labor), int(util)
             )
@@ -301,13 +237,13 @@ async def handle_message(update: Update, context):
                 date,
                 intent.get("description", ""),
                 intent.get("category", "Other"),
-                intent.get("amount", 0),
+                int(intent.get("amount", 0)),
                 intent.get("payment_method", "Cash"),
             )
             await update.message.reply_text(
                 f"✅ *Expense မှတ်ပြီ!*\n"
                 f"{intent.get('description')} — {intent.get('category')}\n"
-                f"Amount: `{intent.get('amount',0):,}` ကျပ်",
+                f"Amount: `{int(intent.get('amount',0)):,}` ကျပ်",
                 parse_mode="Markdown"
             )
 
@@ -322,7 +258,7 @@ async def handle_message(update: Update, context):
             await update.message.reply_text(
                 f"✅ *Stock ထည့်ပြီ!*\n"
                 f"{intent.get('item')} — `{intent.get('quantity')} {intent.get('unit')}`\n"
-                f"Unit Cost: `{intent.get('unit_cost',0):,}` ကျပ်",
+                f"Unit Cost: `{int(intent.get('unit_cost',0)):,}` ကျပ်",
                 parse_mode="Markdown"
             )
 
@@ -333,7 +269,7 @@ async def handle_message(update: Update, context):
                 float(intent.get("quantity", 0)),
                 intent.get("unit", "kg"),
             )
-            warn = "\n⚠️ Low stock — ဝယ်ဖို့ လိုပြီ!" if remaining < 5 else ""
+            warn = "\n⚠️ Low stock — ဝယ်ဖို့ လိုပြီ!" if float(remaining) < 5 else ""
             await update.message.reply_text(
                 f"✅ Stock သုံးမှတ်ပြီ!\n"
                 f"လက်ကျန်: `{remaining} {intent.get('unit','')}`{warn}",
@@ -341,8 +277,7 @@ async def handle_message(update: Update, context):
             )
 
         elif action == "query_sales":
-            period = intent.get("period", "month")
-            if period == "today":
+            if intent.get("period") == "today":
                 rev = get_today_revenue()
                 await update.message.reply_text(
                     f"📊 *ဒီနေ့ Revenue*\n\n`{rev:,}` ကျပ်",
@@ -359,16 +294,12 @@ async def handle_message(update: Update, context):
 
         elif action == "query_pl":
             await cmd_pl(update, context)
-
         elif action == "query_yield":
             await cmd_yield(update, context)
-
         elif action == "query_stock":
             await cmd_stock(update, context)
-
         elif action == "query_kpi":
             await cmd_kpi(update, context)
-
         else:
             await update.message.reply_text(
                 "❓ နားမလည်ပါ။ ဥပမာများ:\n"
@@ -400,21 +331,20 @@ DASH_HTML = """<!DOCTYPE html>
 body{font-family:Arial,sans-serif;background:#f0f4f0;color:#222}
 .topbar{background:#1a5c38;color:#fff;padding:14px 24px;display:flex;align-items:center;gap:12px}
 .topbar h1{font-size:18px;font-weight:700}
-.topbar span{font-size:13px;opacity:.8;margin-left:auto}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:14px;padding:20px}
+.topbar .ts{font-size:13px;opacity:.8;margin-left:auto}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;padding:20px}
 .card{background:#fff;border-radius:12px;padding:16px;box-shadow:0 2px 8px rgba(0,0,0,.07)}
-.card .label{font-size:12px;color:#666;margin-bottom:6px}
+.card .label{font-size:11px;color:#666;margin-bottom:6px;text-transform:uppercase;letter-spacing:.5px}
 .card .value{font-size:22px;font-weight:700;color:#1a5c38}
 .card .value.red{color:#c62828}
 .card .value.blue{color:#1565c0}
 .section{margin:0 20px 20px;background:#fff;border-radius:12px;padding:20px;box-shadow:0 2px 8px rgba(0,0,0,.07)}
 .section h2{font-size:15px;font-weight:700;color:#1a5c38;margin-bottom:14px;border-bottom:2px solid #e8f5e9;padding-bottom:8px}
-.pl-row{display:flex;justify-content:space-between;padding:7px 0;font-size:14px;border-bottom:1px solid #f5f5f5}
+.pl-row{display:flex;justify-content:space-between;padding:8px 0;font-size:14px;border-bottom:1px solid #f5f5f5}
 .pl-row.total{font-weight:700;font-size:16px;color:#1a5c38;border-top:2px solid #1a5c38;border-bottom:none;margin-top:4px;padding-top:10px}
 .pl-row.minus{color:#c62828}
 .charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px;margin:0 20px 20px}
 .chart-card{background:#fff;border-radius:12px;padding:16px;box-shadow:0 2px 8px rgba(0,0,0,.07)}
-.alerts{margin:0 20px 20px}
 .alert-item{background:#fff3f3;border-left:4px solid #c62828;border-radius:6px;padding:10px 14px;margin-bottom:8px;font-size:13px}
 .alert-ok{background:#f1f8f1;border-left-color:#1a5c38}
 .footer{text-align:center;font-size:12px;color:#999;padding:16px}
@@ -424,7 +354,7 @@ body{font-family:Arial,sans-serif;background:#f0f4f0;color:#222}
 <div class="topbar">
   <div>🥩</div>
   <h1>GreenArt Beef Jerky — Executive Dashboard</h1>
-  <span>Live · {{ts}}</span>
+  <span class="ts">Live · {{ts}}</span>
 </div>
 
 <div class="grid">
@@ -432,17 +362,17 @@ body{font-family:Arial,sans-serif;background:#f0f4f0;color:#222}
   <div class="card"><div class="label">ဒီလ Revenue</div><div class="value">{{month_rev}}</div></div>
   <div class="card"><div class="label">Gross Profit</div><div class="value">{{gp}}</div></div>
   <div class="card"><div class="label">Net Profit</div><div class="value {{net_cls}}">{{net}}</div></div>
-  <div class="card"><div class="label">Net Margin</div><div class="value {{net_cls}} blue">{{margin}}%</div></div>
+  <div class="card"><div class="label">Net Margin</div><div class="value blue">{{margin}}%</div></div>
   <div class="card"><div class="label">Avg Yield %</div><div class="value {{yield_cls}}">{{yield_pct}}%</div></div>
   <div class="card"><div class="label">Inventory Value</div><div class="value blue">{{inv_val}}</div></div>
   <div class="card"><div class="label">Batches (ဒီလ)</div><div class="value">{{batches}}</div></div>
 </div>
 
 <div class="section">
-  <h2>💰 Profit & Loss Statement (ဒီလ)</h2>
+  <h2>💰 Profit &amp; Loss Statement (ဒီလ)</h2>
   <div class="pl-row"><span>📈 Revenue</span><span>{{revenue}} ကျပ်</span></div>
   <div class="pl-row minus"><span>➖ COGS (Production)</span><span>({{cogs}}) ကျပ်</span></div>
-  <div class="pl-row"><span>✅ Gross Profit</span><span>{{gp_val}} ကျပ်  ({{gp_margin}}%)</span></div>
+  <div class="pl-row"><span>✅ Gross Profit</span><span>{{gp_val}} ကျပ্  ({{gp_margin}}%)</span></div>
   <div class="pl-row minus"><span>➖ Operating Expenses</span><span>({{opex}}) ကျပ်</span></div>
   <div class="pl-row total"><span>🏆 Net Profit</span><span>{{net_val}} ကျပ်  ({{net_margin}}%)</span></div>
 </div>
@@ -450,38 +380,33 @@ body{font-family:Arial,sans-serif;background:#f0f4f0;color:#222}
 <div class="charts">
   <div class="chart-card"><canvas id="cProduct"></canvas></div>
   <div class="chart-card"><canvas id="cChannel"></canvas></div>
-  <div class="chart-card" style="grid-column:span 2"><canvas id="cStock"></canvas></div>
+  <div class="chart-card" style="grid-column:span 2"><canvas id="cDaily"></canvas></div>
 </div>
 
-<div class="alerts">
-  <div class="section" style="margin:0">
-    <h2>🚨 Alerts</h2>
-    {{alerts_html}}
-  </div>
+<div class="section" style="margin:0 20px 20px">
+  <h2>🚨 Alerts</h2>
+  {{alerts_html}}
 </div>
 
-<div class="footer">GreenArt Beef Jerky AI Dashboard · Powered by Claude AI</div>
+<div class="footer">GreenArt Beef Jerky · AI Dashboard · {{ts}}</div>
 
 <script>
-const GREEN=['#1a5c38','#2e7d4f','#3a7d5a','#4caf76','#81c995'];
-const LABELS_P={{product_labels}};
-const DATA_P={{product_data}};
-const LABELS_C={{channel_labels}};
-const DATA_C={{channel_data}};
-const LABELS_S={{stock_labels}};
-const DATA_S={{stock_data}};
-
+const G=['#1a5c38','#2e7d4f','#4caf76','#81c995','#c8e6c9'];
 new Chart(document.getElementById('cProduct'),{type:'bar',data:{
-  labels:LABELS_P,datasets:[{label:'Revenue (ကျပ်)',data:DATA_P,backgroundColor:'#1a5c38'}]
+  labels:{{product_labels}},
+  datasets:[{label:'Revenue (ကျပ်)',data:{{product_data}},backgroundColor:'#1a5c38'}]
 },options:{plugins:{title:{display:true,text:'Product အလိုက် Revenue'}},responsive:true}});
 
 new Chart(document.getElementById('cChannel'),{type:'doughnut',data:{
-  labels:LABELS_C,datasets:[{data:DATA_C,backgroundColor:GREEN}]
+  labels:{{channel_labels}},
+  datasets:[{data:{{channel_data}},backgroundColor:G}]
 },options:{plugins:{title:{display:true,text:'Channel Share'}},responsive:true}});
 
-new Chart(document.getElementById('cStock'),{type:'bar',data:{
-  labels:LABELS_S,datasets:[{label:'Stock Qty',data:DATA_S,backgroundColor:'#2e7d4f'}]
-},options:{indexAxis:'y',plugins:{title:{display:true,text:'Current Stock Level'}},responsive:true}});
+new Chart(document.getElementById('cDaily'),{type:'line',data:{
+  labels:{{daily_labels}},
+  datasets:[{label:'Daily Revenue',data:{{daily_data}},
+    borderColor:'#1a5c38',tension:.3,fill:true,backgroundColor:'rgba(26,92,56,.1)'}]
+},options:{plugins:{title:{display:true,text:'နေ့စဉ် Revenue Trend'}},responsive:true}});
 </script>
 </body>
 </html>"""
@@ -490,26 +415,31 @@ new Chart(document.getElementById('cStock'),{type:'bar',data:{
 @flask_app.route("/")
 def dashboard():
     try:
-        kpi = get_dashboard_kpi()
-        pl  = get_pl_summary()
+        kpi   = get_dashboard_kpi()
+        pl    = get_pl_summary()
         items, channels, _ = get_kpi()
-        stock = get_stock()
+
+        # Daily trend from sales table
+        try:
+            from database import get_conn as _gc
+            conn = _gc(); c = conn.cursor()
+            c.execute("SELECT date, SUM(total_revenue) FROM sales GROUP BY date ORDER BY date DESC LIMIT 30")
+            daily_raw = list(reversed(c.fetchall())); conn.close()
+        except Exception:
+            daily_raw = []
 
         def fmt(n): return f"{int(n):,}"
-
         net_cls   = "red" if pl["net_profit"] < 0 else ""
         yield_cls = "red" if kpi["avg_yield_pct"] < 55 else ""
 
-        # Alerts
         alerts = []
         if kpi["cash_balance"] < 1_000_000:
             alerts.append(("❌", f"Cash Balance နည်းနေ: {fmt(kpi['cash_balance'])} ကျပ်"))
-        if kpi["avg_yield_pct"] > 0 and kpi["avg_yield_pct"] < 55:
+        if kpi["avg_yield_pct"] and kpi["avg_yield_pct"] < 55:
             alerts.append(("❌", f"Yield ကျနေ: {kpi['avg_yield_pct']}% (Target: 60%)"))
         if pl["net_margin"] < 0:
             alerts.append(("❌", f"Loss ဖြစ်နေ: Net Margin {pl['net_margin']}%"))
-        low = get_low_stock(3)
-        for item, cat, qty, unit, *_ in low:
+        for item, cat, qty, unit, *_ in get_low_stock(3):
             alerts.append(("⚠️", f"Low Stock: {item} — {qty} {unit}"))
         if not alerts:
             alerts.append(("✅", "ပြဿနာ မတွေ့ — ပုံမှန် လည်ပတ်နေ"))
@@ -520,38 +450,38 @@ def dashboard():
         )
 
         html = DASH_HTML
-        replacements = {
-            "{{ts}}":            datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "{{today_rev}}":     fmt(kpi["today_revenue"]),
-            "{{month_rev}}":     fmt(kpi["month_revenue"]),
-            "{{gp}}":            fmt(pl["gross_profit"]),
-            "{{net}}":           fmt(pl["net_profit"]),
-            "{{net_cls}}":       net_cls,
-            "{{yield_cls}}":     yield_cls,
-            "{{yield_pct}}":     str(kpi["avg_yield_pct"]),
-            "{{inv_val}}":       fmt(kpi["inventory_value"]),
-            "{{batches}}":       str(kpi["month_batches"]),
-            "{{revenue}}":       fmt(pl["revenue"]),
-            "{{cogs}}":          fmt(pl["cogs"]),
-            "{{gp_val}}":        fmt(pl["gross_profit"]),
-            "{{gp_margin}}":     str(pl["gp_margin"]),
-            "{{opex}}":          fmt(pl["opex"]),
-            "{{net_val}}":       fmt(pl["net_profit"]),
-            "{{net_margin}}":    str(pl["net_margin"]),
-            "{{alerts_html}}":   alerts_html,
-            "{{product_labels}}":str([r[0] for r in items]),
-            "{{product_data}}":  str([r[2] for r in items]),
-            "{{channel_labels}}":str([r[0] for r in channels]),
-            "{{channel_data}}":  str([r[1] for r in channels]),
-            "{{stock_labels}}":  str([r[0] for r in stock]),
-            "{{stock_data}}":    str([float(r[2]) for r in stock]),
-        }
-        for k, v in replacements.items():
+        for k, v in {
+            "{{ts}}":             datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "{{today_rev}}":      fmt(kpi["today_revenue"]),
+            "{{month_rev}}":      fmt(kpi["month_revenue"]),
+            "{{gp}}":             fmt(pl["gross_profit"]),
+            "{{net}}":            fmt(pl["net_profit"]),
+            "{{net_cls}}":        net_cls,
+            "{{yield_cls}}":      yield_cls,
+            "{{yield_pct}}":      str(kpi["avg_yield_pct"]),
+            "{{inv_val}}":        fmt(kpi["inventory_value"]),
+            "{{batches}}":        str(kpi["month_batches"]),
+            "{{revenue}}":        fmt(pl["revenue"]),
+            "{{cogs}}":           fmt(pl["cogs"]),
+            "{{gp_val}}":         fmt(pl["gross_profit"]),
+            "{{gp_margin}}":      str(pl["gp_margin"]),
+            "{{opex}}":           fmt(pl["opex"]),
+            "{{net_val}}":        fmt(pl["net_profit"]),
+            "{{net_margin}}":     str(pl["net_margin"]),
+            "{{alerts_html}}":    alerts_html,
+            "{{product_labels}}": str([r[0] for r in items]),
+            "{{product_data}}":   str([r[2] for r in items]),
+            "{{channel_labels}}": str([r[0] for r in channels]),
+            "{{channel_data}}":   str([r[1] for r in channels]),
+            "{{daily_labels}}":   str([str(r[0]) for r in daily_raw]),
+            "{{daily_data}}":     str([r[1] for r in daily_raw]),
+        }.items():
             html = html.replace(k, str(v))
         return html
 
     except Exception as e:
-        return f"<h2>Dashboard Error: {e}</h2><p>Database ချိတ်ဆက်ပါ သို့မဟုတ် init_db() ပြေးပါ</p>"
+        return (f"<h2 style='color:red;padding:20px'>Dashboard Error: {e}</h2>"
+                f"<p style='padding:20px'>DATABASE_URL စစ်ပါ / init_db() ပြေးပါ</p>")
 
 
 def run_flask():

@@ -1,7 +1,7 @@
 python-telegram-bot==20.7
-anthropic>=0.25.0
 python-dotenv
 flask
 pandas
 openpyxl
 psycopg2-binary
+anthropic>=0.25.0
